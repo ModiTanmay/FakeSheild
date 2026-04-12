@@ -46,7 +46,7 @@ class BioSimilarity:
         """
         from config import Config
         
-        score = self.calculase_similarity(original_bio, suspect_bio)
+        score = self.calculate_similarity(original_bio, suspect_bio)
         
         return {
             'similarity_score': round(score, 2),

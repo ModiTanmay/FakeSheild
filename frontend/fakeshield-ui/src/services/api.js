@@ -7,7 +7,8 @@ const apiClient = axios.create({
   headers: {
     'Content-Type': 'application/json',
   },
-  timeout: 5000,
+  // Real scraping can take tens of seconds depending on Apify/Mongo latency.
+  timeout: 300000,
 });
 
 export const api = {

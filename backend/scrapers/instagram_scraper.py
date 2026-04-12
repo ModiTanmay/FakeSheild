@@ -1,65 +1,122 @@
-import instaloader
+import os
+import time
 import logging
+import requests
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
 class InstagramScraper:
+    """Scrape Instagram profiles via Apify actor runs."""
+
+    BASE_URL = "https://api.apify.com/v2"
+    ACTOR_ID = "shu8hvrXbJbY3Eb9W"
+    REQUEST_TIMEOUT_SECONDS = 30
+    POLLING_INTERVAL_SECONDS = 5
+    MAX_WAIT_SECONDS = 300
+
     def __init__(self):
-        self.loader = instaloader.Instaloader(
-            quiet=True,
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        )
-    
-    def extract_username_from_url(self, url: str) -> str:
-        """
-        Extract Instagram username from URL
-        Example: https://instagram.com/john_doe -> john_doe
-        """
-        url = url.rstrip('/').strip()
-        return url.split('/')[-1]
-    
-    def scrape_profile(self, username: str):
-        """
-        Scrape Instagram profile data
-        
-        Returns:
-        {
-            'username': str,
-            'name': str,
-            'bio': str,
-            'followers': int,
-            'following': int,
-            'post_count': int,
-            'profile_pic_url': str,
-            'platform': 'instagram'
+        self.apify_token = os.getenv("APIFY_TOKEN", "").strip()
+        if not self.apify_token:
+            raise RuntimeError("APIFY_TOKEN is not configured in environment variables")
+
+    @staticmethod
+    def normalize_username(value: str) -> str:
+        """Normalize @username or URL into plain instagram username."""
+        if not value:
+            return ""
+
+        cleaned = value.strip()
+        if "instagram.com/" in cleaned:
+            cleaned = cleaned.split("instagram.com/")[-1]
+        cleaned = cleaned.strip("/")
+        cleaned = cleaned.split("?")[0]
+        cleaned = cleaned.split("#")[0]
+        return cleaned.lstrip("@").lower()
+
+    def _headers(self) -> dict:
+        return {
+            "Authorization": f"Bearer {self.apify_token}",
+            "Content-Type": "application/json",
         }
-        """
-        try:
-            profile = self.loader.context.username_to_profile(username)
-            
-            return {
-                'username': profile.username,
-                'name': profile.full_name,
-                'bio': profile.biography,
-                'followers': profile.follower_count,
-                'following': profile.following_count,
-                'post_count': profile.mediacount,
-                'profile_pic_url': profile.profile_pic_url,
-                'platform': 'instagram'
-            }
-        
-        except instaloader.exceptions.ProfileNotExistsException:
-            logger.error(f"Profile {username} does not exist")
-            return None
-        except Exception as e:
-            logger.error(f"Error scraping {username}: {str(e)}")
-            return None
+
+    def _build_direct_urls(self, usernames: list[str]) -> list[str]:
+        direct_urls = []
+        for username in usernames:
+            normalized = self.normalize_username(username)
+            if normalized:
+                direct_urls.append(f"https://www.instagram.com/{normalized}/")
+        return direct_urls
+    
+    def scrape_profile(self, usernames: list[str], scan_id: str) -> list[dict]:
+        """Run Apify actor and return raw profile objects from dataset items."""
+        direct_urls = self._build_direct_urls(usernames)
+        if not direct_urls:
+            return []
+
+        logger.info("Starting Apify run for %s usernames (scan_id=%s)", len(direct_urls), scan_id)
+
+        run_response = requests.post(
+            f"{self.BASE_URL}/acts/{self.ACTOR_ID}/runs",
+            headers=self._headers(),
+            json={
+                "directUrls": direct_urls,
+                "resultsType": "details",
+                "resultsLimit": 1,
+                "addParentData": False,
+            },
+            timeout=self.REQUEST_TIMEOUT_SECONDS,
+        )
+        run_response.raise_for_status()
+
+        run_data = run_response.json().get("data", {})
+        run_id = run_data.get("id")
+        dataset_id = run_data.get("defaultDatasetId")
+
+        if not run_id or not dataset_id:
+            raise RuntimeError("Apify run started but missing run id or dataset id")
+
+        deadline = time.time() + self.MAX_WAIT_SECONDS
+        while time.time() < deadline:
+            status_response = requests.get(
+                f"{self.BASE_URL}/acts/{self.ACTOR_ID}/runs/{run_id}",
+                headers=self._headers(),
+                timeout=self.REQUEST_TIMEOUT_SECONDS,
+            )
+            status_response.raise_for_status()
+
+            status = status_response.json().get("data", {}).get("status", "UNKNOWN")
+            logger.debug("Apify polling (run_id=%s, status=%s)", run_id, status)
+
+            if status == "SUCCEEDED":
+                break
+            if status in ("FAILED", "ABORTED", "TIMED-OUT"):
+                raise RuntimeError(f"Apify run {run_id} ended with status: {status}")
+
+            time.sleep(self.POLLING_INTERVAL_SECONDS)
+        else:
+            raise RuntimeError(f"Apify run {run_id} timed out after {self.MAX_WAIT_SECONDS} seconds")
+
+        items_response = requests.get(
+            f"{self.BASE_URL}/datasets/{dataset_id}/items",
+            headers=self._headers(),
+            params={"format": "json"},
+            timeout=self.REQUEST_TIMEOUT_SECONDS,
+        )
+        items_response.raise_for_status()
+        profiles = items_response.json()
+
+        if not isinstance(profiles, list):
+            return []
+        return profiles
     
     def search_similar_usernames(self, original_username: str, limit: int = 10) -> list:
-        """
-        Generate similar usernames (common impersonation patterns)
-        """
+        """Generate common impersonation username variants."""
         variations = [
             f"{original_username}official",
             f"{original_username}_official",

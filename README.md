@@ -6,7 +6,8 @@ The repository includes:
 - A Flask backend API (scan, health, history, report)
 - A React frontend dashboard (scan UI, results, history)
 - ML helper modules for similarity and behavioral checks
-- Dataset and extension folders for future model/data work
+- Apify integration for Instagram profile/post scraping
+- MongoDB persistence for scans, profiles, posts, and stored result payloads
 
 ## Table Of Contents
 
@@ -26,10 +27,12 @@ The repository includes:
 Current flow:
 1. User enters a profile URL/username in the frontend.
 2. Frontend sends request to backend `/api/detect-impersonation`.
-3. Backend currently returns sample/mock suspicious account results.
-4. Frontend renders risk summary and detailed findings.
+3. Backend normalizes username, builds candidate impersonation usernames, and scrapes via Apify.
+4. Backend stores scan data in MongoDB (scan history, profiles, posts, response payload).
+5. Detection pipeline scores candidates and classifies risk.
+6. Frontend renders risk summary and detailed findings.
 
-The ML modules in `backend/ml_modules` and detection pipeline in `backend/detection` are present for the real scoring workflow, but the exposed routes currently return mocked payloads.
+History and View Results now load actual stored scan results by `scan_id`.
 
 ## Repository Structure
 
@@ -41,7 +44,7 @@ fakeshield/
 │  ├─ config.py                # Global config and risk thresholds
 │  ├─ requirements.txt         # Python dependencies
 │  ├─ database/
-│  │  └─ __init__.py           # Placeholder for DB connection logic
+│  │  └─ __init__.py           # MongoDB client, upserts, scan history/result helpers
 │  ├─ detection/
 │  │  ├─ detector.py           # FakeAccountDetector orchestration
 │  │  ├─ reason_converter.py   # Human-readable reason mapping
@@ -52,9 +55,9 @@ fakeshield/
 │  │  ├─ behavioral.py         # Follower ratio and account-age analysis
 │  │  └─ __init__.py
 │  ├─ routes/
-│  │  └─ __init__.py           # API route registration (health, scan, history, report)
+│  │  └─ __init__.py           # API routes with scraper + detector + persistence wiring
 │  ├─ scrapers/
-│  │  ├─ instagram_scraper.py  # Instagram scraping helper class
+│  │  ├─ instagram_scraper.py  # Apify actor run/poll/fetch integration
 │  │  └─ __init__.py
 │  └─ utils/
 │     └─ __init__.py           # Common helpers (responses, validation, scoring)
@@ -74,8 +77,8 @@ fakeshield/
 │        ├─ services/
 │        │  └─ api.js
 │        └─ styles/
-├─ dataset/                    # Placeholder for datasets
-└─ ml_modules/                 # Top-level placeholder (currently not wired)
+├─ dataset/                    # Optional local datasets
+└─ ml_modules/                 # Top-level placeholder
 ```
 
 ## Architecture
@@ -88,13 +91,14 @@ flowchart LR
 		FE -->|HTTP /api/*| BE[Flask Backend\nbackend/main.py]
 
 		BE --> R[Routes Layer\nbackend/routes]
+		R --> AP[Apify Instagram Scraper Actor\nshu8hvrXbJbY3Eb9W]
 		R --> D[Detection Pipeline\nbackend/detection]
 		D --> M1[Bio Similarity\nbackend/ml_modules/bio_similarity.py]
 		D --> M2[Username Similarity\nbackend/ml_modules/username_similarity.py]
 		D --> M3[Behavioral Analysis\nbackend/ml_modules/behavioral.py]
 		R --> S[Scraper Layer\nbackend/scrapers]
 		R --> UTL[Utilities\nbackend/utils]
-		R --> DB[(Database Placeholder\nbackend/database)]
+		R --> DB[(MongoDB\nscan_history/instagram_profiles/instagram_posts)]
 ```
 
 ### Backend Request Flow
@@ -104,15 +108,20 @@ sequenceDiagram
 		participant C as Client (React)
 		participant A as Flask App
 		participant RT as Routes
+		participant AP as Apify
 		participant DP as Detection Pipeline
+		participant MDB as MongoDB
 		participant ML as ML Modules
 
 		C->>A: POST /api/detect-impersonation
 		A->>RT: Route handler
+		RT->>AP: Run actor + poll + fetch dataset items
+		RT->>MDB: Save scan/profile/post data
 		RT->>DP: Build and run detection logic
 		DP->>ML: Similarity + behavior scoring
 		ML-->>DP: Signal scores
 		DP-->>RT: Classification + reasons
+		RT->>MDB: Save result payload by scan_id
 		RT-->>C: JSON response
 ```
 
@@ -125,12 +134,23 @@ sequenceDiagram
 	- CORS for `/api/*`
 	- request/response logging hooks
 	- centralized error handlers
+	- default backend port aligned to `8001`
 - `backend/routes/__init__.py`
 	- `GET /api/health`
 	- `POST /api/detect-impersonation`
 	- `GET /api/results/<scan_id>`
 	- `GET /api/history`
 	- `POST /api/report`
+	- stores full per-scan response payload and returns by `scan_id`
+- `backend/scrapers/instagram_scraper.py`
+	- Runs Apify actor `shu8hvrXbJbY3Eb9W`
+	- Polls run status until success/failure/timeout
+	- Fetches dataset items and returns raw profile list
+- `backend/database/__init__.py`
+	- singleton MongoDB connection
+	- upsert profile/post documents
+	- create/update scan records
+	- save/load result payloads for history view
 - `backend/detection/detector.py`
 	- Combines bio, username, name, and behavioral signals
 	- Classifies as fake if at least 2 signals match
@@ -146,6 +166,11 @@ Current design checks:
 - Follower/following ratio
 - Account age recency
 
+Current models/rules:
+- SentenceTransformer `all-MiniLM-L6-v2` for bio embeddings
+- FuzzyWuzzy ratio for username and name similarity
+- Rule thresholds from `backend/config.py`
+
 ## Frontend
 
 ### Key Files
@@ -154,8 +179,10 @@ Current design checks:
 	- Main state container and page switching
 	- Backend health polling
 	- Scan action orchestration
+	- View Results now fetches detailed result payload by `scan_id`
 - `frontend/fakeshield-ui/src/services/api.js`
 	- API client and endpoint wrappers
+	- extended request timeout for long-running scans
 - `frontend/fakeshield-ui/src/pages/*`
 	- `Home.js`: intro landing
 	- `Scan.js`: input + platform selection form
@@ -184,10 +211,10 @@ Request body:
 Returns scan summary and suspicious account data.
 
 ### `GET /results/<scan_id>`
-Returns stored or mock result data for a scan ID.
+Returns stored detailed scan result payload for a scan ID.
 
 ### `GET /history`
-Returns prior scan list (currently mock data).
+Returns persisted scan history from MongoDB, including `scan_id`, input, timestamp, and found count.
 
 ### `POST /report`
 Request body:
@@ -244,34 +271,25 @@ Default UI URL: `http://localhost:3000`
 Backend reads environment variables from `.env` (inside `backend/`):
 
 ```env
-MONGODB_URI=mongodb://localhost:27017
+MONGODB_URI=mongodb+srv://<user>:<password>@cluster0.h5dhu2u.mongodb.net/?appName=Cluster0
 DB_NAME=fakeshield
-APIFY_TOKEN=
+APIFY_TOKEN=your_apify_api_token_here
 API_HOST=0.0.0.0
-API_PORT=8000
+ API_PORT=8001
 FLASK_DEBUG=True
 ```
 
 ## Known Gaps And Notes
 
-1. Port mismatch by default:
-	 - Backend defaults to port `8000` (`backend/main.py`).
-	 - Frontend API calls target `8001` (`frontend/fakeshield-ui/src/App.js` and `frontend/fakeshield-ui/src/services/api.js`).
-	 - Fix by either setting `API_PORT=8001` in backend `.env`, or updating frontend base URLs.
-
-2. API route data is mostly mocked/static in `backend/routes/__init__.py`.
-
-3. Typo bug in `backend/ml_modules/bio_similarity.py`:
-	 - `self.calculase_similarity(...)` should be `self.calculate_similarity(...)`.
-
-4. Some libraries used in code are not listed in `backend/requirements.txt` (for example `sentence-transformers`, `fuzzywuzzy`, `instaloader`).
-
-5. Database and top-level `dataset/` + `ml_modules/` folders are scaffolding placeholders right now.
+1. Scan runtime depends on Apify actor latency; some requests can take tens of seconds.
+2. Existing old mock/test history documents may still appear until replaced by new scans.
+3. Current candidate discovery is rule-based username variation generation, not embedding-based nearest-neighbor search.
+4. Twitter/LinkedIn in UI are currently placeholders in results unless dedicated scrapers are added.
 
 ## Next Improvements
 
-1. Wire routes to real scraper + detector pipeline (replace mocked responses).
-2. Align frontend/backend port config through a single environment-based API base URL.
-3. Fix typo in bio similarity module and add unit tests for detector outputs.
-4. Add persistent storage for scan history and reports.
-5. Add authentication and rate limiting policies for production deployment.
+1. Add dedicated historical results page that shows detector raw scores/signals for each fake account.
+2. Store candidate-generation metadata and scrape diagnostics for auditability.
+3. Add pagination and filtering for history endpoint.
+4. Move API base URL to environment config in frontend.
+5. Add automated tests for scraper polling, DB persistence, and route contracts.

@@ -93,7 +93,13 @@ function App() {
       }
     } catch (error) {
       console.error('Scan error:', error);
-      setError('Failed to scan. Make sure backend is running on port 8001');
+      if (error.code === 'ECONNABORTED') {
+        setError('Scan timed out. Please try again or scan a different username.');
+      } else if (error.response?.data?.error) {
+        setError(error.response.data.error);
+      } else {
+        setError('Failed to scan. Please check backend logs and try again.');
+      }
     } finally {
       setLoading(false);
     }
@@ -103,15 +109,27 @@ function App() {
     setCurrentPage(page);
   };
 
-  const handleViewResult = (scanId) => {
-    const result = scanHistory.find(item => item.scan_id === scanId);
-    if (result) {
-      setScanResults({
-        scan_id: result.scan_id,
-        timestamp: result.timestamp,
-        results: {}
-      });
-      setCurrentPage('results');
+  const handleViewResult = async (scanId) => {
+    setLoading(true);
+    setError(null);
+
+    try {
+      const response = await api.getResults(scanId);
+      if (response.success && response.data) {
+        setScanResults(response.data);
+        setCurrentPage('results');
+      } else {
+        setError(response.error || 'Result not found for this scan.');
+      }
+    } catch (error) {
+      console.error('View result error:', error);
+      if (error.response?.data?.error) {
+        setError(error.response.data.error);
+      } else {
+        setError('Failed to load scan details. Please try again.');
+      }
+    } finally {
+      setLoading(false);
     }
   };
 
